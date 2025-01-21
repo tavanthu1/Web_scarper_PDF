@@ -1,0 +1,132 @@
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <curl/curl.h>
+#include <set>
+#include <regex>
+#include <thread>
+#include <chrono>
+
+namespace fs = std::filesystem;
+
+// Hàm callback để ghi dữ liệu tải xuống vào tệp
+size_t write_data(void* ptr, size_t size, size_t nmemb, std::ofstream* stream) {
+    stream->write(static_cast<char*>(ptr), size * nmemb);
+    return size * nmemb;
+}
+
+// Hàm tải tệp với tiến độ hiển thị
+bool download_file_with_progress(const std::string& url, const std::string& folder_name, int progress, int total, int retries = 3) {
+    std::string filename = folder_name + "/" + url.substr(url.find_last_of("/") + 1);
+    
+    // Kiểm tra nếu tệp đã tồn tại
+    if (fs::exists(filename)) {
+        std::cout << "(" << progress << "/" << total << ") Đã tồn tại: " << filename << std::endl;
+        return true;
+    }
+
+    CURL* curl;
+    CURLcode res;
+    int attempt = 0;
+
+    while (attempt < retries) {
+        curl = curl_easy_init();
+        if (curl) {
+            std::ofstream file(filename, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "Không thể tạo tệp: " << filename << std::endl;
+                return false;
+            }
+
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &file);
+
+            // Lấy kích thước tệp từ server
+            double total_size = 0;
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, [](void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) -> int {
+                double percentage = dltotal > 0 ? (static_cast<double>(dlnow) / dltotal) * 100.0 : 0.0;
+                std::cout << "\rĐang tải: " << percentage << "% hoàn thành" << std::flush;
+                return 0;
+            });
+
+            res = curl_easy_perform(curl);
+
+            if (res == CURLE_OK) {
+                std::cout << "\n(" << progress << "/" << total << ") Đã tải: " << filename << std::endl;
+                file.close();
+                curl_easy_cleanup(curl);
+                return true;
+            } else {
+                std::cerr << "\n(" << progress << "/" << total << ") Lỗi tải " << url << ": " << curl_easy_strerror(res) << ". Thử lại..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                attempt++;
+                file.close();
+                fs::remove(filename);
+            }
+        }
+    }
+
+    std::cerr << "(" << progress << "/" << total << ") Thất bại: Không thể tải " << url << " sau " << retries << " lần thử." << std::endl;
+    return false;
+}
+
+// Hàm tải danh sách tệp PDF từ trang web
+void scrape_pdfs(const std::string& base_url, const std::string& folder_name) {
+    CURL* curl;
+    CURLcode res;
+    std::string html_content;
+
+    curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, [](void* ptr, size_t size, size_t nmemb, std::string* data) -> size_t {
+            data->append(static_cast<char*>(ptr), size * nmemb);
+            return size * nmemb;
+        });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &html_content);
+
+        res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            std::cerr << "Không thể truy cập " << base_url << ": " << curl_easy_strerror(res) << std::endl;
+            curl_easy_cleanup(curl);
+            return;
+        }
+        curl_easy_cleanup(curl);
+    }
+
+    // Phân tích HTML để tìm các liên kết PDF
+    std::set<std::string> pdf_links;
+    std::regex pdf_regex(R"((http[s]?://.*?\.pdf))");
+    std::smatch match;
+    while (std::regex_search(html_content, match, pdf_regex)) {
+        pdf_links.insert(match[0].str());
+        html_content = match.suffix();
+    }
+
+    if (pdf_links.empty()) {
+        std::cout << "Không tìm thấy tệp PDF nào." << std::endl;
+        return;
+    }
+
+    // Tạo thư mục lưu trữ
+    fs::create_directories(folder_name);
+
+    int total_files = pdf_links.size();
+    std::cout << "Tìm thấy " << total_files << " tệp PDF. Bắt đầu tải..." << std::endl;
+
+    int progress = 1;
+    for (const auto& pdf_url : pdf_links) {
+        download_file_with_progress(pdf_url, folder_name, progress++, total_files);
+    }
+}
+
+int main() {
+    std::string base_url = "https://hayhay.work.gd/";
+    std::string folder_name = "downloaded_pdfs";
+
+    scrape_pdfs(base_url, folder_name);
+
+    return 0;
+}
